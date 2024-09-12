@@ -51,7 +51,7 @@
 #define FALLBACK_ALLOWED_HOSTS "*"
 #define MAX_BLACKLIST_ENTRIES 100
 
-// Vorwärtsdeklaration der Funktion handle_https
+// Forward declaration of the handle_https function
 void handle_https(int client_socket, const char *hostname, int port);
 
 // Configuration structure to store program settings
@@ -257,12 +257,12 @@ void log_request(const char *client_ip, const char *method, const char *url, con
            client_ip, time_str, method, url, protocol, status_code, content_length, referer ? referer : "-", user_agent);
 }
 
-// Funktion zur Verarbeitung von HTTPS (CONNECT-Methode)
+// Function for processing HTTPS (CONNECT method)
 void handle_https(int client_socket, const char *hostname, int port) {
     int server_socket;
     struct sockaddr_in server_addr;
 
-    // Neue Socket-Verbindung für den Zielserver erstellen
+    // Create a new socket connection for the target server
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         perror("Error creating server socket for HTTPS");
@@ -270,7 +270,7 @@ void handle_https(int client_socket, const char *hostname, int port) {
         return;
     }
 
-    // Zielserver-Adresse einrichten
+    // Set up target server address
     struct hostent *server = gethostbyname(hostname);
     if (server == NULL) {
         perror("Error resolving target host for HTTPS");
@@ -283,7 +283,7 @@ void handle_https(int client_socket, const char *hostname, int port) {
     server_addr.sin_port = htons(port);
     memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
-    // Verbindung zum Zielserver herstellen
+    // Establishing a connection to the target server
     if (connect(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Error connecting to target server for HTTPS");
         close(client_socket);
@@ -291,11 +291,11 @@ void handle_https(int client_socket, const char *hostname, int port) {
         return;
     }
 
-    // Antwort an den Client senden, dass die Verbindung hergestellt wurde
+    // Send a response to the client that the connection has been established
     const char *connection_established = "HTTP/1.1 200 Connection Established\r\n\r\n";
     send(client_socket, connection_established, strlen(connection_established), 0);
 
-    // Daten zwischen Client und Server weiterleiten
+    // Forwarding data between client and server
     fd_set fdset;
     char buffer[BUFFER_SIZE];
     int max_fd = (client_socket > server_socket ? client_socket : server_socket) + 1;
@@ -305,21 +305,21 @@ void handle_https(int client_socket, const char *hostname, int port) {
         FD_SET(client_socket, &fdset);
         FD_SET(server_socket, &fdset);
 
-        // Warten auf Aktivität bei Client oder Server
+        // Waiting for activity on client or server
         int activity = select(max_fd, &fdset, NULL, NULL, NULL);
         if (activity < 0) {
             perror("Error on select()");
             break;
         }
 
-        // Daten vom Client an den Server weiterleiten
+        // Forwarding data from the client to the server
         if (FD_ISSET(client_socket, &fdset)) {
             int bytes_received = recv(client_socket, buffer, sizeof(buffer), 0);
             if (bytes_received <= 0) break;
             send(server_socket, buffer, bytes_received, 0);
         }
 
-        // Daten vom Server an den Client weiterleiten
+        // Forward data from the server to the client
         if (FD_ISSET(server_socket, &fdset)) {
             int bytes_received = recv(server_socket, buffer, sizeof(buffer), 0);
             if (bytes_received <= 0) break;
