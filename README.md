@@ -1,7 +1,7 @@
 # rproxy
 roberts proxy - a very small and fast webproxy written in c
 
-# Parameter
+## Parameter
 
 ```bash
 rproxy --help
@@ -20,13 +20,11 @@ Options:
   -V, --version              Display the program version
 ```
 
-# Compiling and installing rproxy
+## Compiling and installing rproxy
 
 To compile the C code and create a finished binary program, you can use a Makefile. This Makefile automates the compilation process and, if desired, also the installation of the program on your system.
 
-## Steps
-
-## Explanation Makefile
+### Explanation Makefile
 
 - CC: The compiler, in this case gcc.
 - CFLAGS: The flags for the compiler. -Wall activates all warnings, and -pthread adds the pthread library for multithreading support.
@@ -38,9 +36,9 @@ To compile the C code and create a finished binary program, you can use a Makefi
 - clean: Removes all generated object and binary files.
 - uninstall: Removes the binary program from /usr/local/bin.
 
-## Steps for compilation and installation
+### Steps for compilation and installation
 
-### Compile
+#### Compile
 
 Navigate to the directory containing the C code and the Makefile and execute the following command to compile the program.
 
@@ -49,7 +47,7 @@ make
 ```
 This will create an executable binary program called rproxy in the same directory.
 
-### Install (optional)
+##### Install (optional)
 
 If you want to install the program system-wide (e.g. to /usr/local/bin), execute the following command.
 
@@ -59,7 +57,7 @@ sudo make install
 
 This copies the program to /usr/local/bin (or where it was specified in the Makefile) so that you can call it from anywhere by simply entering rproxy in the command line.
 
-### Clean up
+##### Clean up
 
 To remove the generated object files and the binary program from the directory, you can use the following command.
 
@@ -67,7 +65,7 @@ To remove the generated object files and the binary program from the directory, 
 make clean
 ```
 
-### Uninstall (optional)
+##### Uninstall (optional)
 
 To remove the program from /usr/local/bin again, execute this command.
 
@@ -75,7 +73,7 @@ To remove the program from /usr/local/bin again, execute this command.
 sudo make uninstall
 ```
 
-### After the installation
+##### After the installation
 
 After the installation by `make install` you can simply run the program by typing `rproxy` in your terminal. You can use the parameters that you have implemented in the program, e.g.
 
