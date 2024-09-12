@@ -1,6 +1,24 @@
 # rproxy
 roberts proxy - a very small and fast webproxy written in c
 
+# Parameter
+
+```bash
+rproxy --help
+No configuration file found at /root/.rproxy.conf. Using fallback variables.
+Usage: rproxy [OPTIONS]
+A simple multithreaded HTTP/HTTPS proxy server.
+
+Options:
+  -p, --port <port>          Specify the port to listen on (default: 8080)
+  -l, --listen <ip>          Specify the IP address to listen on (default: 0.0.0.0)
+  -a, --allowed-hosts <list> Comma-separated list of allowed hosts or IPs
+  -b, --black-list <list>    Comma-separated list of blacklisted URLs, IPs, or IP ranges
+  -v, --verbose              Enable verbose output
+  -g, --generate-config      Generate configuration file in ~/.rproxy.conf
+  -h, --help                 Display this help message
+  -V, --version              Display the program version
+```
 
 # Compiling and installing rproxy
 
@@ -69,22 +87,4 @@ If the program was only compiled by `make`, you can execute the program by enter
 
 ```bash
 ./rproxy -p 8080 -l 0.0.0.0 -v
-```
-
-
-```bash
-rproxy --help
-No configuration file found at /root/.rproxy.conf. Using fallback variables.
-Usage: rproxy [OPTIONS]
-A simple multithreaded HTTP/HTTPS proxy server.
-
-Options:
-  -p, --port <port>          Specify the port to listen on (default: 8080)
-  -l, --listen <ip>          Specify the IP address to listen on (default: 0.0.0.0)
-  -a, --allowed-hosts <list> Comma-separated list of allowed hosts or IPs
-  -b, --black-list <list>    Comma-separated list of blacklisted URLs, IPs, or IP ranges
-  -v, --verbose              Enable verbose output
-  -g, --generate-config      Generate configuration file in ~/.rproxy.conf
-  -h, --help                 Display this help message
-  -V, --version              Display the program version
 ```
