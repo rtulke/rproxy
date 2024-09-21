@@ -1,5 +1,5 @@
 # rproxy
-roberts proxy - a very small and fast webproxy written in c
+rproxy - a very small and fast webproxy written in c
 
 ## Parameter
 
