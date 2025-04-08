@@ -14,11 +14,53 @@ Options:
   -l, --listen <ip>          Specify the IP address to listen on (default: 0.0.0.0)
   -a, --allowed-hosts <list> Comma-separated list of allowed hosts or IPs
   -b, --black-list <list>    Comma-separated list of blacklisted URLs, IPs, or IP ranges
+  -t, --timeout <seconds>    Set connection timeout in seconds (default: 30)
+  -A, --auth                 Enable basic authentication
+  -U, --username <user>      Set authentication username (default: admin)
+  -P, --password <pass>      Set authentication password (default: password)
   -v, --verbose              Enable verbose output
   -g, --generate-config      Generate configuration file in ~/.rproxy.conf
   -h, --help                 Display this help message
   -V, --version              Display the program version
 ```
+
+## Features
+
+- Multithreaded proxy server with thread pool for better resource management
+- Support for both HTTP and HTTPS connections
+- Configurable allowed hosts and blacklist
+- Connection timeout settings
+- Basic authentication support
+- Dynamic blacklist implementation
+- Proper signal handling for clean shutdown
+- Improved error handling with HTTP error responses
+
+## Configuration File
+
+rproxy can be configured using a configuration file located at `~/.rproxy.conf`. You can generate a default configuration file using:
+
+```bash
+rproxy --generate-config
+```
+
+The configuration file contains the following settings:
+
+```
+listen=0.0.0.0
+port=8080
+allowed_hosts=*
+black_list=
+timeout=30
+auth_enabled=0
+auth_user=admin
+auth_pass=password
+```
+
+## Dependencies
+
+rproxy depends on the following libraries:
+- pthread (for multithreading)
+- base64 (for authentication)
 
 ## Compiling and installing rproxy
 
@@ -28,6 +70,7 @@ To compile the C code and create a finished binary program, you can use a Makefi
 
 - CC: The compiler, in this case gcc.
 - CFLAGS: The flags for the compiler. -Wall activates all warnings, and -pthread adds the pthread library for multithreading support.
+- LDFLAGS: Linker flags for additional libraries (like -lbase64).
 - TARGET: The name of the generated binary program (in this case rproxy).
 - SRCS: The source files (here only rproxy.c).
 - OBJS: The object files that are automatically generated from the source files.
@@ -35,6 +78,36 @@ To compile the C code and create a finished binary program, you can use a Makefi
 - install: Copies the binary program to /usr/local/bin so that it can be used system-wide.
 - clean: Removes all generated object and binary files.
 - uninstall: Removes the binary program from /usr/local/bin.
+
+### Sample Makefile
+
+```make
+CC = gcc
+CFLAGS = -Wall -pthread
+LDFLAGS = -lbase64
+TARGET = rproxy
+SRCS = rproxy.c
+OBJS = $(SRCS:.c=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+install:
+	install -m 755 $(TARGET) /usr/local/bin/
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+uninstall:
+	rm -f /usr/local/bin/$(TARGET)
+
+.PHONY: all install clean uninstall
+```
 
 ### Steps for compilation and installation
 
@@ -85,4 +158,26 @@ If the program was only compiled by `make`, you can execute the program by enter
 
 ```bash
 ./rproxy -p 8080 -l 0.0.0.0 -v
+```
+
+## Examples
+
+### Running with basic authentication
+```bash
+rproxy -A -U myuser -P mysecretpassword
+```
+
+### Setting a custom timeout
+```bash
+rproxy -t 60
+```
+
+### Using both blacklist and authentication
+```bash
+rproxy -b "facebook.com,twitter.com" -A -v
+```
+
+### Limiting access to specific client IPs
+```bash
+rproxy -a "192.168.1.10,192.168.1.11"
 ```
