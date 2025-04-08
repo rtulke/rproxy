@@ -5,7 +5,7 @@ rproxy - a very small and fast webproxy written in c
 
 ```bash
 rproxy --help
-No configuration file found at /root/.rproxy.conf. Using fallback variables.
+
 Usage: rproxy [OPTIONS]
 A simple multithreaded HTTP/HTTPS proxy server.
 
