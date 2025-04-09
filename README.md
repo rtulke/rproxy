@@ -1,5 +1,5 @@
 # rproxy
-rproxy - a very small and fast webproxy written in c
+rproxy - a very small and fast webproxy written in C
 
 ## Parameter
 
@@ -14,6 +14,7 @@ Options:
   -l, --listen <ip>          Specify the IP address to listen on (default: 0.0.0.0)
   -a, --allowed-hosts <list> Comma-separated list of allowed hosts or IPs
   -b, --black-list <list>    Comma-separated list of blacklisted URLs, IPs, or IP ranges
+  -B, --block-clients <list> Comma-separated list of client IPs or IP ranges to block
   -t, --timeout <seconds>    Set connection timeout in seconds (default: 30)
   -A, --auth                 Enable basic authentication
   -U, --username <user>      Set authentication username (default: admin)
@@ -29,12 +30,13 @@ Options:
 - Multithreaded proxy server with thread pool for better resource management
 - Support for both HTTP and HTTPS connections
 - Configurable allowed hosts and blacklist
+- Client IP blocking with support for CIDR notation
 - Connection timeout settings
 - Basic authentication support
 - Dynamic blacklist implementation
 - Proper signal handling for clean shutdown
 - Improved error handling with HTTP error responses
-- Supported and tested Plattforms macOS, Linux
+- Supported and tested Platforms: macOS, Linux
 
 ## Configuration File
 
@@ -51,6 +53,7 @@ listen=0.0.0.0
 port=8080
 allowed_hosts=*
 black_list=
+client_blocklist=
 timeout=30
 auth_enabled=0
 auth_user=admin
@@ -151,4 +154,62 @@ rproxy -b "facebook.com,twitter.com" -A -v
 ### Limiting access to specific client IPs
 ```bash
 rproxy -a "192.168.1.10,192.168.1.11"
+```
+
+### Blocking specific client IPs
+```bash
+rproxy -B "192.168.1.100,10.0.0.0/8"
+```
+
+### Using domain wildcards in blacklist
+```bash
+rproxy -b "*.example.com,facebook.com"
+```
+
+## Blacklist and Blocking Features
+
+### URL Blacklisting
+The `-b` parameter accepts:
+- Exact domains: `example.com`
+- Wildcard domains: `*.example.com` (blocks all subdomains)
+- Individual hostnames or IPs
+
+### Client IP Blocking
+The `-B` parameter accepts:
+- Individual IP addresses: `192.168.1.100`
+- CIDR notation for IP ranges: `10.0.0.0/8` (blocks entire subnets)
+
+### Configuration File Examples
+
+```
+# Block specific websites
+black_list=facebook.com,twitter.com,*.adult-site.com
+
+# Block specific client IPs and ranges
+client_blocklist=192.168.1.100,10.0.0.0/8
+```
+
+## Advanced Usage
+
+### Using Both Blacklist and Client Blocking
+
+You can combine different security features:
+
+```bash
+rproxy -a "192.168.1.0/24" -b "facebook.com,twitter.com" -B "10.0.0.0/8" -A -v
+```
+
+This example:
+- Allows only clients from the 192.168.1.0/24 subnet to use the proxy
+- Blocks access to facebook.com and twitter.com
+- Blocks any clients from the 10.0.0.0/8 subnet
+- Requires authentication
+- Provides verbose output
+
+### Proxy Logging
+
+In verbose mode, rproxy logs connections in a format similar to standard web server logs:
+
+```
+172.17.0.1 - - [06/Apr/2025:14:55:37 +0000] "GET http://example.com/ HTTP/1.1" 200 615 "-" "Mozilla/5.0"
 ```
