@@ -1,0 +1,117 @@
+.TH RPROXY 1 "April 2025" "rproxy 1.2.0" "User Commands"
+.SH NAME
+rproxy \- a simple multithreaded HTTP/HTTPS proxy server
+.SH SYNOPSIS
+.B rproxy
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B rproxy
+is a lightweight HTTP/HTTPS proxy server written in C that supports multithreading,
+URL blacklisting, client IP blocking, connection timeouts, and basic authentication.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-port " " \fIPORT\fR
+Specify the port to listen on (default: 8080).
+.TP
+.BR \-l ", " \-\-listen " " \fIIP\fR
+Specify the IP address to listen on (default: 0.0.0.0).
+.TP
+.BR \-a ", " \-\-allowed\-hosts " " \fILIST\fR
+Comma-separated list of allowed hosts or IPs. Use "*" to allow all hosts.
+.TP
+.BR \-b ", " \-\-black\-list " " \fILIST\fR
+Comma-separated list of blacklisted URLs, hostnames, or domains.
+Supports exact matches (example.com) and wildcard domains (*.example.com).
+.TP
+.BR \-B ", " \-\-block\-clients " " \fILIST\fR
+Comma-separated list of client IPs or IP ranges to block.
+Supports individual IPs (192.168.1.100) and CIDR notation (10.0.0.0/8).
+.TP
+.BR \-t ", " \-\-timeout " " \fISECONDS\fR
+Set connection timeout in seconds (default: 30).
+.TP
+.BR \-A ", " \-\-auth
+Enable basic authentication.
+.TP
+.BR \-U ", " \-\-username " " \fIUSER\fR
+Set authentication username (default: admin).
+.TP
+.BR \-P ", " \-\-password " " \fIPASS\fR
+Set authentication password (default: password).
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output.
+.TP
+.BR \-g ", " \-\-generate\-config
+Generate a default configuration file in ~/.rproxy.conf.
+.TP
+.BR \-h ", " \-\-help
+Display help message.
+.TP
+.BR \-V ", " \-\-version
+Display the program version.
+.SH CONFIGURATION FILE
+rproxy can be configured using a configuration file located at ~/.rproxy.conf. 
+You can generate a default configuration file using:
+
+rproxy --generate-config
+
+The configuration file contains the following settings:
+
+.nf
+listen=0.0.0.0          # IP address to listen on
+port=8080               # Port to listen on
+allowed_hosts=*         # Comma-separated list of allowed hosts/IPs
+black_list=             # Comma-separated list of blacklisted URLs/domains
+client_blocklist=       # Comma-separated list of blocked client IPs/ranges
+timeout=30              # Connection timeout in seconds
+auth_enabled=0          # Enable (1) or disable (0) authentication
+auth_user=admin         # Authentication username
+auth_pass=password      # Authentication password
+.fi
+.SH EXAMPLES
+.TP
+Run with basic authentication:
+.B rproxy -A -U myuser -P mysecretpassword
+.TP
+Set a custom timeout:
+.B rproxy -t 60
+.TP
+Block specific websites:
+.B rproxy -b "facebook.com,twitter.com,*.adult-site.com"
+.TP
+Block specific client IPs:
+.B rproxy -B "192.168.1.100,10.0.0.0/8"
+.TP
+Limit access to specific client IPs:
+.B rproxy -a "192.168.1.10,192.168.1.11"
+.TP
+Combine multiple security features:
+.B rproxy -a "192.168.1.0/24" -b "facebook.com" -B "10.0.0.0/8" -A -v
+.SH SECURITY CONSIDERATIONS
+.PP
+rproxy provides basic filtering capabilities but should not be considered a complete security solution. For production environments, consider additional security measures such as:
+.PP
+- Using HTTPS for all proxy connections
+.PP
+- Implementing stronger authentication methods
+.PP
+- Regularly updating blacklists
+.PP
+- Monitoring proxy logs for suspicious activity
+.SH FILES
+.TP
+.I ~/.rproxy.conf
+User configuration file.
+.SH AUTHOR
+Robert Tulke
+.SH BUGS
+Report bugs to: rt@debian.sh
+.SH SEE ALSO
+squid(1), privoxy(1)
+.SH COPYRIGHT
+Copyright \(co 2025 Robert Tulke.
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+.br
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
