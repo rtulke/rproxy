@@ -79,36 +79,6 @@ To compile the C code and create a finished binary program, you can use a Makefi
 - clean: Removes all generated object and binary files.
 - uninstall: Removes the binary program from /usr/local/bin.
 
-### Sample Makefile
-
-```make
-CC = gcc
-CFLAGS = -Wall -pthread
-LDFLAGS = -lbase64
-TARGET = rproxy
-SRCS = rproxy.c
-OBJS = $(SRCS:.c=.o)
-
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-install:
-	install -m 755 $(TARGET) /usr/local/bin/
-
-clean:
-	rm -f $(OBJS) $(TARGET)
-
-uninstall:
-	rm -f /usr/local/bin/$(TARGET)
-
-.PHONY: all install clean uninstall
-```
-
 ### Steps for compilation and installation
 
 #### Compile
