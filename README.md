@@ -34,6 +34,7 @@ Options:
 - Dynamic blacklist implementation
 - Proper signal handling for clean shutdown
 - Improved error handling with HTTP error responses
+- Supported and tested Plattforms macOS, Linux
 
 ## Configuration File
 
