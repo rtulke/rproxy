@@ -1,9 +1,8 @@
 /*
  * rproxy - A simple multithreaded HTTP/HTTPS proxy server
  *
- * Author: Robert Tulke
- * Email: rt@debian.sh
- * Version: 1.1.0
+ * Author: Robert Tulke (original code)
+ * Version: 1.2.0
  * License: GPL v3.0
  *
  * Description:
@@ -12,11 +11,15 @@
  * server, and relays the responses back to the client.
  *
  * Features:
- * - Supports multithreading using pthreads.
- * - Detects HTTP and HTTPS connections.
- * - Configurable listen IP, running port, allowed hosts, and blacklisted URLs via command-line or configuration file.
- * - Config Generator
- * - Verbose mode for detailed connection logging.
+ * - Supports multithreading using pthreads
+ * - Thread pool for better resource management
+ * - Detects HTTP and HTTPS connections
+ * - Configurable listen IP, running port, allowed hosts, and blacklisted URLs
+ * - Configurable client IP blocking
+ * - Connection timeouts
+ * - Basic authentication
+ * - Config file generation
+ * - Verbose mode for detailed connection logging
  *
  * Usage:
  *   rproxy [OPTIONS]
@@ -26,6 +29,11 @@
  *   -l, --listen <ip>          Specify the IP address to listen on (default: 0.0.0.0)
  *   -a, --allowed-hosts <list> Comma-separated list of allowed hosts or IPs
  *   -b, --black-list <list>    Comma-separated list of blacklisted URLs, IPs, or IP ranges
+ *   -B, --block-clients <list> Comma-separated list of client IPs or IP ranges to block
+ *   -t, --timeout <seconds>    Set connection timeout in seconds (default: 30)
+ *   -A, --auth                 Enable basic authentication
+ *   -U, --username <user>      Set authentication username (default: admin)
+ *   -P, --password <pass>      Set authentication password (default: password)
  *   -v, --verbose              Enable verbose output
  *   -g, --generate-config      Generate configuration file in ~/.rproxy.conf
  *   -h, --help                 Display this help message
@@ -42,26 +50,56 @@
 #include <getopt.h>
 #include <pthread.h>
 #include <time.h>
+#include <signal.h>
+#include <errno.h>
+#include <ctype.h>
+#include <base64.h> // For base64 encoding/decoding (may need to be installed)
 
-#define BUFFER_SIZE 4096
-#define VERSION "1.1.0"
-#define CONFIG_FILE "~/.rproxy.conf" // Standard path to the configuration file
+#define BUFFER_SIZE 8192
+#define VERSION "1.2.0"
+#define CONFIG_FILE "~/.rproxy.conf"
 #define FALLBACK_LISTEN_IP "0.0.0.0"
 #define FALLBACK_PORT 8080
 #define FALLBACK_ALLOWED_HOSTS "*"
+#define DEFAULT_CONNECTION_TIMEOUT 30 // Seconds
+#define THREAD_POOL_SIZE 10
+#define MAX_QUEUE_SIZE 100
+#define DEFAULT_AUTH_ENABLED 0
+#define DEFAULT_AUTH_USER "admin"
+#define DEFAULT_AUTH_PASS "password"
 #define MAX_BLACKLIST_ENTRIES 100
+#define MAX_BLOCKLIST_ENTRIES 100
 
-// Forward declaration of the handle_https function
-void handle_https(int client_socket, const char *hostname, int port);
+// Global variable for proxy socket (for signal handler)
+int global_proxy_socket = -1;
+int shutdown_flag = 0;
+
+// Structure for a blocked IP range
+typedef struct {
+    uint32_t network;    // Network address in host byte order
+    uint32_t netmask;    // Netmask in host byte order
+    char original[64];   // Original entry for debugging
+} IPBlockEntry;
+
+// Structure for client blocklist
+typedef struct {
+    IPBlockEntry entries[MAX_BLOCKLIST_ENTRIES];
+    int count;
+} ClientBlockList;
 
 // Configuration structure to store program settings
 typedef struct {
-    char listen_ip[16];       // listen IP
-    int port;                 // running port
-    char allowed_hosts[1024]; // List of allowed hosts
+    char listen_ip[INET_ADDRSTRLEN];  // listen IP
+    int port;                         // running port
+    char allowed_hosts[1024];         // List of allowed hosts
     char black_list[MAX_BLACKLIST_ENTRIES][256]; // Blacklist of URLs or IPs
-    int black_list_count;     // Number of blacklisted entries
-    int verbose;              // Flag for verbose output
+    int black_list_count;             // Number of blacklisted entries
+    ClientBlockList client_blocklist; // Client IP blocklist
+    int verbose;                      // Flag for verbose output
+    int connection_timeout;           // Connection timeout in seconds
+    int auth_enabled;                 // Enable basic authentication
+    char auth_user[64];               // Authentication username
+    char auth_pass[64];               // Authentication password
 } Config;
 
 // Structure for passing arguments to threads
@@ -70,6 +108,506 @@ typedef struct {
     Config *config;
     struct sockaddr_in client_addr;
 } ThreadArgs;
+
+// Queue structure for thread pool
+typedef struct {
+    ThreadArgs **items;
+    int head;
+    int tail;
+    int size;
+    int capacity;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} JobQueue;
+
+// Global job queue
+JobQueue job_queue;
+
+// Function prototypes
+void initialize_blocklist(ClientBlockList *blocklist);
+int add_to_client_blocklist(ClientBlockList *blocklist, const char *ip_spec);
+int is_client_blocked(ClientBlockList *blocklist, const char *client_ip);
+void parse_client_blocklist(ClientBlockList *blocklist, const char *blocklist_str);
+void debug_client_blocklist(ClientBlockList *blocklist);
+uint32_t ip_to_uint32(const char *ip);
+uint32_t cidr_to_netmask(int prefix_len);
+void handle_signal(int sig);
+void *thread_pool_worker(void *arg);
+int initialize_job_queue(JobQueue *queue, int capacity);
+int enqueue_job(JobQueue *queue, ThreadArgs *args);
+ThreadArgs* dequeue_job(JobQueue *queue);
+void destroy_job_queue(JobQueue *queue);
+void send_http_error(int client_socket, int status_code, const char *message);
+int extract_hostname(const char *url, char *hostname, size_t hostname_size);
+int extract_port(const char *url, int default_port);
+int validate_url(const char *url);
+int set_socket_timeout(int socket, int seconds);
+int is_authenticated(const char *auth_header, const char *username, const char *password);
+void check_root_permissions(int port);
+void print_help();
+void print_version();
+void generate_config();
+void load_config_file(Config *config);
+void parse_arguments(int argc, char *argv[], Config *config);
+int is_allowed_host(Config *config, const char *client_ip);
+int is_blacklisted(Config *config, const char *hostname);
+void log_request(const char *client_ip, const char *method, const char *url, const char *protocol,
+                 const char *user_agent, const char *referer, int status_code, int content_length);
+void handle_https(int client_socket, const char *hostname, int port, Config *config);
+void handle_connection(ThreadArgs *args);
+
+// Signal handler function
+void handle_signal(int sig) {
+    printf("\nReceived signal %d, shutting down...\n", sig);
+    shutdown_flag = 1;
+    
+    // Close the proxy socket
+    if (global_proxy_socket != -1) {
+        close(global_proxy_socket);
+        global_proxy_socket = -1;
+    }
+    
+    // Don't exit immediately, let the main loop handle the shutdown
+}
+
+// Helper function to convert IP address to uint32_t
+uint32_t ip_to_uint32(const char *ip) {
+    struct in_addr addr;
+    inet_pton(AF_INET, ip, &addr);
+    return ntohl(addr.s_addr);
+}
+
+// Helper function to calculate a netmask from CIDR prefix length
+uint32_t cidr_to_netmask(int prefix_len) {
+    if (prefix_len == 0) {
+        return 0;
+    }
+    return ~((1UL << (32 - prefix_len)) - 1);
+}
+
+// Function to initialize the client blocklist
+void initialize_blocklist(ClientBlockList *blocklist) {
+    memset(blocklist, 0, sizeof(ClientBlockList));
+}
+
+// Function to parse and add an IP range to the blocklist
+int add_to_client_blocklist(ClientBlockList *blocklist, const char *ip_spec) {
+    if (blocklist->count >= MAX_BLOCKLIST_ENTRIES) {
+        fprintf(stderr, "Warning: Maximum number of blocklist entries reached.\n");
+        return -1;
+    }
+
+    // Create a copy of the entry and trim whitespace
+    char ip_copy[64];
+    strncpy(ip_copy, ip_spec, sizeof(ip_copy) - 1);
+    ip_copy[sizeof(ip_copy) - 1] = '\0';
+    
+    // Trim leading whitespace
+    char *p = ip_copy;
+    while (*p && isspace(*p)) p++;
+    
+    // Trim trailing whitespace
+    char *end = p + strlen(p) - 1;
+    while (end > p && isspace(*end)) *end-- = '\0';
+    
+    if (strlen(p) == 0) {
+        return 0; // Empty entry, ignore
+    }
+
+    // Check for CIDR notation (e.g. 192.168.1.0/24)
+    char *cidr = strchr(p, '/');
+    int prefix_len = 32; // Default: single IP
+    
+    if (cidr) {
+        *cidr = '\0'; // Split IP and prefix length
+        prefix_len = atoi(cidr + 1);
+        
+        if (prefix_len < 0 || prefix_len > 32) {
+            fprintf(stderr, "Error: Invalid CIDR prefix length in '%s'\n", ip_spec);
+            return -1;
+        }
+    }
+
+    // Validate IP
+    struct in_addr addr;
+    if (inet_pton(AF_INET, p, &addr) != 1) {
+        fprintf(stderr, "Error: Invalid IP address '%s'\n", p);
+        return -1;
+    }
+
+    // Calculate network address and netmask
+    uint32_t ip = ip_to_uint32(p);
+    uint32_t netmask = cidr_to_netmask(prefix_len);
+    uint32_t network = ip & netmask;
+
+    // Insert into blocklist
+    IPBlockEntry *entry = &blocklist->entries[blocklist->count++];
+    entry->network = network;
+    entry->netmask = netmask;
+    strncpy(entry->original, ip_spec, sizeof(entry->original) - 1);
+    entry->original[sizeof(entry->original) - 1] = '\0';
+
+    return 0;
+}
+
+// Function to check if a client IP is in the blocklist
+int is_client_blocked(ClientBlockList *blocklist, const char *client_ip) {
+    if (!client_ip || strlen(client_ip) == 0) {
+        return 0; // Invalid IP, don't block
+    }
+
+    uint32_t ip = ip_to_uint32(client_ip);
+    
+    for (int i = 0; i < blocklist->count; i++) {
+        IPBlockEntry *entry = &blocklist->entries[i];
+        if ((ip & entry->netmask) == entry->network) {
+            return 1; // IP is blocked
+        }
+    }
+    
+    return 0; // IP is not blocked
+}
+
+// Function to parse blocklist from a comma-separated string
+void parse_client_blocklist(ClientBlockList *blocklist, const char *blocklist_str) {
+    if (!blocklist_str || strlen(blocklist_str) == 0) {
+        return; // Empty blocklist
+    }
+    
+    // Make a copy of the string
+    char *blocklist_copy = strdup(blocklist_str);
+    if (!blocklist_copy) {
+        fprintf(stderr, "Error: Memory allocation failed for blocklist copy\n");
+        return;
+    }
+    
+    // Split string by commas
+    char *token = strtok(blocklist_copy, ",");
+    while (token != NULL) {
+        add_to_client_blocklist(blocklist, token);
+        token = strtok(NULL, ",");
+    }
+    
+    free(blocklist_copy);
+}
+
+// Function to debug the blocklist
+void debug_client_blocklist(ClientBlockList *blocklist) {
+    printf("Client blocklist contains %d entries:\n", blocklist->count);
+    for (int i = 0; i < blocklist->count; i++) {
+        IPBlockEntry *entry = &blocklist->entries[i];
+        
+        // Convert IP and mask to readable form
+        struct in_addr net_addr, mask_addr;
+        net_addr.s_addr = htonl(entry->network);
+        mask_addr.s_addr = htonl(entry->netmask);
+        
+        char net_str[INET_ADDRSTRLEN];
+        char mask_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &net_addr, net_str, INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &mask_addr, mask_str, INET_ADDRSTRLEN);
+        
+        // Calculate CIDR prefix length
+        int prefix_len = 0;
+        uint32_t mask = entry->netmask;
+        while (mask & 0x80000000) {
+            prefix_len++;
+            mask <<= 1;
+        }
+        
+        printf("  [%d] Original: '%s', Network: %s/%d\n", 
+               i + 1, entry->original, net_str, prefix_len);
+    }
+}
+
+// Initialize the job queue
+int initialize_job_queue(JobQueue *queue, int capacity) {
+    queue->items = malloc(capacity * sizeof(ThreadArgs*));
+    
+    if (queue->items == NULL) {
+        return -1;
+    }
+    
+    queue->head = 0;
+    queue->tail = 0;
+    queue->size = 0;
+    queue->capacity = capacity;
+    
+    if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
+        free(queue->items);
+        return -1;
+    }
+    
+    if (pthread_cond_init(&queue->not_empty, NULL) != 0) {
+        pthread_mutex_destroy(&queue->mutex);
+        free(queue->items);
+        return -1;
+    }
+    
+    if (pthread_cond_init(&queue->not_full, NULL) != 0) {
+        pthread_cond_destroy(&queue->not_empty);
+        pthread_mutex_destroy(&queue->mutex);
+        free(queue->items);
+        return -1;
+    }
+    
+    return 0;
+}
+
+// Add a job to the queue
+int enqueue_job(JobQueue *queue, ThreadArgs *args) {
+    pthread_mutex_lock(&queue->mutex);
+    
+    while (queue->size == queue->capacity && !shutdown_flag) {
+        pthread_cond_wait(&queue->not_full, &queue->mutex);
+    }
+    
+    if (shutdown_flag) {
+        pthread_mutex_unlock(&queue->mutex);
+        return -1;
+    }
+    
+    queue->items[queue->tail] = args;
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->size++;
+    
+    pthread_cond_signal(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
+    
+    return 0;
+}
+
+// Get a job from the queue
+ThreadArgs* dequeue_job(JobQueue *queue) {
+    pthread_mutex_lock(&queue->mutex);
+    
+    while (queue->size == 0 && !shutdown_flag) {
+        pthread_cond_wait(&queue->not_empty, &queue->mutex);
+    }
+    
+    if (shutdown_flag && queue->size == 0) {
+        pthread_mutex_unlock(&queue->mutex);
+        return NULL;
+    }
+    
+    ThreadArgs *args = queue->items[queue->head];
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->size--;
+    
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->mutex);
+    
+    return args;
+}
+
+// Clean up the job queue
+void destroy_job_queue(JobQueue *queue) {
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->not_empty);
+    pthread_cond_destroy(&queue->not_full);
+    free(queue->items);
+    queue->items = NULL;
+}
+
+// Function to send HTTP error responses
+void send_http_error(int client_socket, int status_code, const char *message) {
+    char response[512];
+    const char *status_text;
+    
+    switch (status_code) {
+        case 400: status_text = "Bad Request"; break;
+        case 403: status_text = "Forbidden"; break;
+        case 404: status_text = "Not Found"; break;
+        case 407: status_text = "Proxy Authentication Required"; break;
+        case 408: status_text = "Request Timeout"; break;
+        case 500: status_text = "Internal Server Error"; break;
+        case 502: status_text = "Bad Gateway"; break;
+        case 504: status_text = "Gateway Timeout"; break;
+        default: status_text = "Unknown Error"; break;
+    }
+    
+    // Create error response
+    int len = snprintf(response, sizeof(response),
+                      "HTTP/1.1 %d %s\r\n"
+                      "Content-Type: text/html\r\n"
+                      "Connection: close\r\n"
+                      "Content-Length: %zu\r\n"
+                      "\r\n"
+                      "<html><body><h1>%d %s</h1><p>%s</p></body></html>",
+                      status_code, status_text,
+                      strlen(message) + 50 + strlen(status_text),
+                      status_code, status_text, message);
+    
+    if (len >= sizeof(response)) {
+        // Response too large - create a simpler one
+        snprintf(response, sizeof(response),
+                "HTTP/1.1 %d %s\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n\r\n",
+                status_code, status_text);
+    }
+    
+    send(client_socket, response, strlen(response), 0);
+}
+
+// Extract hostname from URL with proper validation
+int extract_hostname(const char *url, char *hostname, size_t hostname_size) {
+    if (!url || !hostname || hostname_size == 0) {
+        return -1;
+    }
+    
+    memset(hostname, 0, hostname_size);
+    
+    // First, handle CONNECT method which typically has hostname:port format
+    if (strchr(url, '/') == NULL) {
+        char *colon = strchr(url, ':');
+        if (colon != NULL) {
+            size_t len = colon - url;
+            if (len >= hostname_size) {
+                return -1; // Hostname too long
+            }
+            strncpy(hostname, url, len);
+            hostname[len] = '\0';
+        } else {
+            if (strlen(url) >= hostname_size) {
+                return -1; // Hostname too long
+            }
+            strncpy(hostname, url, hostname_size - 1);
+        }
+        return 0;
+    }
+    
+    // Handle standard URLs with scheme
+    const char *host_start = NULL;
+    
+    if (strncmp(url, "http://", 7) == 0) {
+        host_start = url + 7;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        host_start = url + 8;
+    } else {
+        // URL without scheme, assume the hostname is at the beginning
+        host_start = url;
+    }
+    
+    // Find the end of the hostname (port or path)
+    const char *host_end = host_start;
+    while (*host_end && *host_end != '/' && *host_end != ':' && *host_end != '?' && *host_end != '#') {
+        host_end++;
+    }
+    
+    size_t host_len = host_end - host_start;
+    if (host_len >= hostname_size) {
+        return -1; // Hostname too long
+    }
+    
+    if (host_len == 0) {
+        return -1; // Empty hostname
+    }
+    
+    // Copy the hostname
+    strncpy(hostname, host_start, host_len);
+    hostname[host_len] = '\0';
+    
+    return 0;
+}
+
+// Extract port from URL
+int extract_port(const char *url, int default_port) {
+    const char *colon = strchr(url, ':');
+    
+    // If there's no colon or it's part of the scheme (http://)
+    if (colon == NULL || colon == url + 4 || colon == url + 5) {
+        // Check if there's another colon (for the port)
+        colon = strchr((colon == NULL) ? url : colon + 1, ':');
+    }
+    
+    if (colon != NULL) {
+        colon++; // Skip the colon
+        
+        // Make sure there are digits after the colon
+        if (*colon >= '0' && *colon <= '9') {
+            // Parse the port number
+            int port = atoi(colon);
+            
+            // Check if the port is in a valid range
+            if (port > 0 && port < 65536) {
+                return port;
+            }
+        }
+    }
+    
+    return default_port;
+}
+
+// URL validation
+int validate_url(const char *url) {
+    if (url == NULL || *url == '\0') {
+        return 0;
+    }
+    
+    // Check for obviously malformed URLs
+    if (strchr(url, ' ') != NULL) {
+        return 0;
+    }
+    
+    // Check for valid scheme (or no scheme which is valid for CONNECT)
+    if (strncmp(url, "http://", 7) != 0 && 
+        strncmp(url, "https://", 8) != 0 && 
+        strchr(url, '/') != NULL) {
+        // Not a CONNECT style URL and doesn't have a valid scheme
+        return 0;
+    }
+    
+    // Additional checks could be added here
+    
+    return 1;
+}
+
+// Set socket timeout
+int set_socket_timeout(int socket, int seconds) {
+    struct timeval timeout;
+    timeout.tv_sec = seconds;
+    timeout.tv_usec = 0;
+    
+    if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
+        return -1;
+    }
+    
+    if (setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout)) < 0) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+// Check Basic authentication
+int is_authenticated(const char *auth_header, const char *username, const char *password) {
+    if (auth_header == NULL) {
+        return 0;
+    }
+    
+    // Skip "Basic " prefix
+    const char *encoded = auth_header + 6;
+    
+    // Decode the Base64 credentials
+    unsigned char decoded[128];
+    memset(decoded, 0, sizeof(decoded));
+    
+    // In a real implementation, use a proper base64 decoder
+    // This is a placeholder for the actual implementation
+    int decoded_len = base64_decode(encoded, decoded, sizeof(decoded) - 1);
+    
+    if (decoded_len < 0) {
+        return 0;
+    }
+    
+    // Format should be "username:password"
+    char expected[128];
+    snprintf(expected, sizeof(expected), "%s:%s", username, password);
+    
+    return strcmp((char *)decoded, expected) == 0;
+}
 
 // Function to check for root privileges if the port is below 1024
 void check_root_permissions(int port) {
@@ -88,6 +626,11 @@ void print_help() {
     printf("  -l, --listen <ip>          Specify the IP address to listen on (default: 0.0.0.0)\n");
     printf("  -a, --allowed-hosts <list> Comma-separated list of allowed hosts or IPs\n");
     printf("  -b, --black-list <list>    Comma-separated list of blacklisted URLs, IPs, or IP ranges\n");
+    printf("  -B, --block-clients <list> Comma-separated list of client IPs or IP ranges to block\n");
+    printf("  -t, --timeout <seconds>    Set connection timeout in seconds (default: 30)\n");
+    printf("  -A, --auth                 Enable basic authentication\n");
+    printf("  -U, --username <user>      Set authentication username (default: admin)\n");
+    printf("  -P, --password <pass>      Set authentication password (default: password)\n");
     printf("  -v, --verbose              Enable verbose output\n");
     printf("  -g, --generate-config      Generate configuration file in ~/.rproxy.conf\n");
     printf("  -h, --help                 Display this help message\n");
@@ -116,6 +659,11 @@ void generate_config() {
     fprintf(file, "port=%d\n", FALLBACK_PORT);
     fprintf(file, "allowed_hosts=%s\n", FALLBACK_ALLOWED_HOSTS);
     fprintf(file, "black_list=\n"); // Blacklist is empty initially
+    fprintf(file, "client_blocklist=\n"); // Client blocklist is empty initially
+    fprintf(file, "timeout=%d\n", DEFAULT_CONNECTION_TIMEOUT);
+    fprintf(file, "auth_enabled=%d\n", DEFAULT_AUTH_ENABLED);
+    fprintf(file, "auth_user=%s\n", DEFAULT_AUTH_USER);
+    fprintf(file, "auth_pass=%s\n", DEFAULT_AUTH_PASS);
 
     fclose(file);
     printf("Configuration file created at %s\n", config_path);
@@ -133,28 +681,61 @@ void load_config_file(Config *config) {
         strcpy(config->listen_ip, FALLBACK_LISTEN_IP);
         config->port = FALLBACK_PORT;
         strcpy(config->allowed_hosts, FALLBACK_ALLOWED_HOSTS);
+        config->connection_timeout = DEFAULT_CONNECTION_TIMEOUT;
+        config->auth_enabled = DEFAULT_AUTH_ENABLED;
+        strcpy(config->auth_user, DEFAULT_AUTH_USER);
+        strcpy(config->auth_pass, DEFAULT_AUTH_PASS);
         return;
     }
 
     char line[256];
     while (fgets(line, sizeof(line), file)) {
+        // Remove newline character
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') {
+            line[len-1] = '\0';
+        }
+        
         if (strncmp(line, "listen=", 7) == 0) {
-            sscanf(line + 7, "%15s", config->listen_ip);
+            strncpy(config->listen_ip, line + 7, sizeof(config->listen_ip) - 1);
         } else if (strncmp(line, "port=", 5) == 0) {
             config->port = atoi(line + 5);
         } else if (strncmp(line, "allowed_hosts=", 14) == 0) {
-            sscanf(line + 14, "%1023[^\n]", config->allowed_hosts);
+            strncpy(config->allowed_hosts, line + 14, sizeof(config->allowed_hosts) - 1);
         } else if (strncmp(line, "black_list=", 11) == 0) {
             char *blacklist = line + 11;
             char *token = strtok(blacklist, ",");
             while (token != NULL && config->black_list_count < MAX_BLACKLIST_ENTRIES) {
-                strncpy(config->black_list[config->black_list_count++], token, 255);
+                // Trim leading and trailing whitespace
+                while (*token && isspace(*token)) token++;
+                char *end = token + strlen(token) - 1;
+                while (end > token && isspace(*end)) *end-- = '\0';
+                
+                if (strlen(token) > 0) {
+                    strncpy(config->black_list[config->black_list_count++], token, 255);
+                    config->black_list[config->black_list_count-1][255] = '\0';
+                }
                 token = strtok(NULL, ",");
             }
+        } else if (strncmp(line, "client_blocklist=", 17) == 0) {
+            parse_client_blocklist(&config->client_blocklist, line + 17);
+        } else if (strncmp(line, "timeout=", 8) == 0) {
+            config->connection_timeout = atoi(line + 8);
+        } else if (strncmp(line, "auth_enabled=", 13) == 0) {
+            config->auth_enabled = atoi(line + 13);
+        } else if (strncmp(line, "auth_user=", 10) == 0) {
+            strncpy(config->auth_user, line + 10, sizeof(config->auth_user) - 1);
+        } else if (strncmp(line, "auth_pass=", 10) == 0) {
+            strncpy(config->auth_pass, line + 10, sizeof(config->auth_pass) - 1);
         }
     }
 
     fclose(file);
+    
+    if (config->verbose) {
+        debug_client_blocklist(&config->client_blocklist);
+    }
+    
     printf("Configuration loaded from %s\n", config_path);
 }
 
@@ -165,6 +746,11 @@ void parse_arguments(int argc, char *argv[], Config *config) {
         {"listen", required_argument, 0, 'l'},
         {"allowed-hosts", required_argument, 0, 'a'},
         {"black-list", required_argument, 0, 'b'},
+        {"block-clients", required_argument, 0, 'B'},
+        {"timeout", required_argument, 0, 't'},
+        {"auth", no_argument, 0, 'A'},
+        {"username", required_argument, 0, 'U'},
+        {"password", required_argument, 0, 'P'},
         {"verbose", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'V'},
@@ -173,7 +759,7 @@ void parse_arguments(int argc, char *argv[], Config *config) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:l:a:b:vhVg", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:l:a:b:B:t:AU:P:vhVg", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 config->port = atoi(optarg);
@@ -185,13 +771,39 @@ void parse_arguments(int argc, char *argv[], Config *config) {
                 strncpy(config->allowed_hosts, optarg, sizeof(config->allowed_hosts) - 1);
                 break;
             case 'b': {
+                // Reset the blacklist count before adding new entries
+                config->black_list_count = 0;
+                
                 char *token = strtok(optarg, ",");
                 while (token != NULL && config->black_list_count < MAX_BLACKLIST_ENTRIES) {
-                    strncpy(config->black_list[config->black_list_count++], token, 255);
+                    // Trim leading and trailing whitespace
+                    while (*token && isspace(*token)) token++;
+                    char *end = token + strlen(token) - 1;
+                    while (end > token && isspace(*end)) *end-- = '\0';
+                    
+                    if (strlen(token) > 0) {
+                        strncpy(config->black_list[config->black_list_count++], token, 255);
+                        config->black_list[config->black_list_count-1][255] = '\0';
+                    }
                     token = strtok(NULL, ",");
                 }
                 break;
             }
+            case 'B':
+                parse_client_blocklist(&config->client_blocklist, optarg);
+                break;
+            case 't':
+                config->connection_timeout = atoi(optarg);
+                break;
+            case 'A':
+                config->auth_enabled = 1;
+                break;
+            case 'U':
+                strncpy(config->auth_user, optarg, sizeof(config->auth_user) - 1);
+                break;
+            case 'P':
+                strncpy(config->auth_pass, optarg, sizeof(config->auth_pass) - 1);
+                break;
             case 'v':
                 config->verbose = 1;
                 break;
@@ -212,11 +824,58 @@ void parse_arguments(int argc, char *argv[], Config *config) {
     }
 }
 
-// Function to check if the given URL or IP is in the blacklist
+// Function to check if the given URL or hostname is in the blacklist
 int is_blacklisted(Config *config, const char *hostname) {
     for (int i = 0; i < config->black_list_count; i++) {
-        if (strstr(hostname, config->black_list[i]) != NULL) {
-            return 1; // Blacklisted
+        // Strip leading and trailing whitespace from blacklist entry
+        char entry[256];
+        strncpy(entry, config->black_list[i], sizeof(entry) - 1);
+        entry[sizeof(entry) - 1] = '\0';
+        
+        // Trim leading whitespace
+        char *p = entry;
+        while (*p && isspace(*p)) {
+            p++;
+        }
+        
+        // Trim trailing whitespace
+        char *end = p + strlen(p) - 1;
+        while (end > p && isspace(*end)) {
+            *end-- = '\0';
+        }
+        
+        if (strlen(p) == 0) {
+            continue; // Skip empty entries
+        }
+        
+        // For IP-based blacklisting
+        if (strchr(p, '.') && !strchr(p, '*')) {
+            // Direct IP comparison
+            if (strcmp(hostname, p) == 0) {
+                return 1; // Exact IP match
+            }
+        }
+        // For domain-based blacklisting
+        else {
+            // Check for wildcard domain match
+            if (p[0] == '*' && p[1] == '.') {
+                // Wildcard domain (e.g., *.example.com)
+                const char *domain = p + 2; // Skip "*."
+                size_t domain_len = strlen(domain);
+                size_t hostname_len = strlen(hostname);
+                
+                // Check if hostname ends with the domain
+                if (hostname_len > domain_len &&
+                    strcmp(hostname + hostname_len - domain_len, domain) == 0) {
+                    return 1; // Subdomain match
+                }
+            }
+            // Check for exact domain match
+            else {
+                if (strcmp(hostname, p) == 0) {
+                    return 1; // Exact domain match
+                }
+            }
         }
     }
     return 0; // Not blacklisted
@@ -231,9 +890,16 @@ int is_allowed_host(Config *config, const char *client_ip) {
 
     // Split allowed hosts by commas and check if client IP matches
     char allowed_hosts_copy[1024];
-    strncpy(allowed_hosts_copy, config->allowed_hosts, sizeof(allowed_hosts_copy));
+    strncpy(allowed_hosts_copy, config->allowed_hosts, sizeof(allowed_hosts_copy) - 1);
+    allowed_hosts_copy[sizeof(allowed_hosts_copy) - 1] = '\0';
+    
     char *token = strtok(allowed_hosts_copy, ",");
     while (token != NULL) {
+        // Trim leading and trailing whitespace
+        while (*token && isspace(*token)) token++;
+        char *end = token + strlen(token) - 1;
+        while (end > token && isspace(*end)) *end-- = '\0';
+        
         if (strcmp(token, client_ip) == 0) {
             return 1; // Allowed host
         }
@@ -254,26 +920,40 @@ void log_request(const char *client_ip, const char *method, const char *url, con
     // Log format:
     // 172.17.0.1 - - [06/Aug/2024:14:55:37 +0000] "GET / HTTP/1.1" 200 615 "-" "Mozilla/5.0"
     printf("%s - - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
-           client_ip, time_str, method, url, protocol, status_code, content_length, referer ? referer : "-", user_agent);
+           client_ip, time_str, method, url, protocol, status_code, content_length, 
+           referer ? referer : "-", user_agent ? user_agent : "-");
 }
 
-// Function for processing HTTPS (CONNECT method)
-void handle_https(int client_socket, const char *hostname, int port) {
+// Improved function for processing HTTPS (CONNECT method)
+void handle_https(int client_socket, const char *hostname, int port, Config *config) {
     int server_socket;
     struct sockaddr_in server_addr;
 
     // Create a new socket connection for the target server
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
-        perror("Error creating server socket for HTTPS");
+        if (config->verbose) {
+            perror("Error creating server socket for HTTPS");
+        }
+        send_http_error(client_socket, 502, "Failed to create socket to target server");
         close(client_socket);
         return;
+    }
+
+    // Set socket timeout
+    if (set_socket_timeout(server_socket, config->connection_timeout) < 0) {
+        if (config->verbose) {
+            perror("Failed to set socket timeout");
+        }
     }
 
     // Set up target server address
     struct hostent *server = gethostbyname(hostname);
     if (server == NULL) {
-        perror("Error resolving target host for HTTPS");
+        if (config->verbose) {
+            perror("Error resolving target host for HTTPS");
+        }
+        send_http_error(client_socket, 502, "Failed to resolve target host");
         close(client_socket);
         close(server_socket);
         return;
@@ -285,7 +965,10 @@ void handle_https(int client_socket, const char *hostname, int port) {
 
     // Establishing a connection to the target server
     if (connect(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Error connecting to target server for HTTPS");
+        if (config->verbose) {
+            perror("Error connecting to target server for HTTPS");
+        }
+        send_http_error(client_socket, 502, "Failed to connect to target server");
         close(client_socket);
         close(server_socket);
         return;
@@ -300,82 +983,219 @@ void handle_https(int client_socket, const char *hostname, int port) {
     char buffer[BUFFER_SIZE];
     int max_fd = (client_socket > server_socket ? client_socket : server_socket) + 1;
 
-    while (1) {
+    while (!shutdown_flag) {
         FD_ZERO(&fdset);
         FD_SET(client_socket, &fdset);
         FD_SET(server_socket, &fdset);
 
+        // Set up timeout for select
+        struct timeval timeout;
+        timeout.tv_sec = config->connection_timeout;
+        timeout.tv_usec = 0;
+
         // Waiting for activity on client or server
-        int activity = select(max_fd, &fdset, NULL, NULL, NULL);
+        int activity = select(max_fd, &fdset, NULL, NULL, &timeout);
+        
         if (activity < 0) {
-            perror("Error on select()");
+            if (errno == EINTR) {
+                // Interrupted by a signal, check if we should exit
+                if (shutdown_flag) {
+                    break;
+                }
+                continue;
+            }
+            
+            if (config->verbose) {
+                perror("Error on select()");
+            }
+            break;
+        }
+        
+        if (activity == 0) {
+            // Timeout reached
+            if (config->verbose) {
+                printf("Connection timed out\n");
+            }
             break;
         }
 
         // Forwarding data from the client to the server
         if (FD_ISSET(client_socket, &fdset)) {
             int bytes_received = recv(client_socket, buffer, sizeof(buffer), 0);
-            if (bytes_received <= 0) break;
-            send(server_socket, buffer, bytes_received, 0);
+            if (bytes_received <= 0) {
+                break; // Client disconnected or error
+            }
+            
+            int bytes_sent = 0;
+            while (bytes_sent < bytes_received) {
+                int result = send(server_socket, buffer + bytes_sent, bytes_received - bytes_sent, 0);
+                if (result <= 0) {
+                    if (config->verbose) {
+                        perror("Error sending data to server");
+                    }
+                    break;
+                }
+                bytes_sent += result;
+            }
+            
+            if (bytes_sent < bytes_received) {
+                break; // Failed to send all data
+            }
         }
 
         // Forward data from the server to the client
         if (FD_ISSET(server_socket, &fdset)) {
             int bytes_received = recv(server_socket, buffer, sizeof(buffer), 0);
-            if (bytes_received <= 0) break;
-            send(client_socket, buffer, bytes_received, 0);
+            if (bytes_received <= 0) {
+                break; // Server disconnected or error
+            }
+            
+            int bytes_sent = 0;
+            while (bytes_sent < bytes_received) {
+                int result = send(client_socket, buffer + bytes_sent, bytes_received - bytes_sent, 0);
+                if (result <= 0) {
+                    if (config->verbose) {
+                        perror("Error sending data to client");
+                    }
+                    break;
+                }
+                bytes_sent += result;
+            }
+            
+            if (bytes_sent < bytes_received) {
+                break; // Failed to send all data
+            }
         }
     }
 
+    // Clean up
     close(server_socket);
     close(client_socket);
 }
 
-// Function to handle the connection between client and server
-void handle_connection(int client_socket, Config *config, struct sockaddr_in client_addr) {
+// Improved function to handle the connection between client and server
+void handle_connection(ThreadArgs *args) {
+    int client_socket = args->client_socket;
+    Config *config = args->config;
+    struct sockaddr_in client_addr = args->client_addr;
     char buffer[BUFFER_SIZE];
     int bytes_received;
+
+    // Set socket timeout
+    if (set_socket_timeout(client_socket, config->connection_timeout) < 0) {
+        if (config->verbose) {
+            perror("Failed to set client socket timeout");
+        }
+    }
 
     // Get the client's IP address
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+
+    // Check if the client's IP is blocked
+    if (is_client_blocked(&config->client_blocklist, client_ip)) {
+        if (config->verbose) {
+            printf("Blocked: Client IP %s is on the blocklist.\n", client_ip);
+        }
+        send_http_error(client_socket, 403, "Your IP address is blocked by the proxy administrator");
+        close(client_socket);
+        free(args);
+        return;
+    }
 
     // Check if the client's IP is allowed
     if (!is_allowed_host(config, client_ip)) {
         if (config->verbose) {
             printf("Blocked: The IP %s is not allowed to access the proxy.\n", client_ip);
         }
-        const char *blocked_response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-        send(client_socket, blocked_response, strlen(blocked_response), 0);
+        send_http_error(client_socket, 403, "Your IP address is not allowed to use this proxy");
         close(client_socket);
+        free(args);
         return;
     }
 
     // Receive data from the client
-    bytes_received = recv(client_socket, buffer, sizeof(buffer), 0);
+    bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
     if (bytes_received <= 0) {
         if (config->verbose) {
-            printf("Error receiving data from the client.\n");
+            printf("Error receiving data from the client or client disconnected.\n");
         }
         close(client_socket);
+        free(args);
+        return;
+    }
+    
+    // Null-terminate the buffer for string operations
+    buffer[bytes_received] = '\0';
+
+    // Parse the request to extract the method, URL, and protocol
+    char method[16] = {0}, url[BUFFER_SIZE] = {0}, protocol[16] = {0};
+    if (sscanf(buffer, "%15s %4095s %15s", method, url, protocol) != 3) {
+        if (config->verbose) {
+            printf("Invalid HTTP request format\n");
+        }
+        send_http_error(client_socket, 400, "Invalid HTTP request format");
+        close(client_socket);
+        free(args);
         return;
     }
 
-    // Parse the request to extract the method, URL, and protocol
-    char method[10], url[256], protocol[10];
-    sscanf(buffer, "%s %s %s", method, url, protocol);
+    // Validate the URL
+    if (!validate_url(url)) {
+        if (config->verbose) {
+            printf("Invalid URL: %s\n", url);
+        }
+        send_http_error(client_socket, 400, "Invalid URL format");
+        close(client_socket);
+        free(args);
+        return;
+    }
 
-    // Extract relevant headers (User-Agent, Referer, etc.)
-    char user_agent[256] = "-", referer[256] = "-";
+    // Extract relevant headers (User-Agent, Referer, Authorization, etc.)
+    char user_agent[256] = "-", referer[256] = "-", auth_header[512] = {0};
     char *user_agent_ptr = strstr(buffer, "User-Agent:");
     char *referer_ptr = strstr(buffer, "Referer:");
+    char *auth_ptr = strstr(buffer, "Proxy-Authorization: Basic ");
 
     if (user_agent_ptr) {
-        sscanf(user_agent_ptr, "User-Agent: %[^\r\n]", user_agent);
+        sscanf(user_agent_ptr, "User-Agent: %255[^\r\n]", user_agent);
     }
 
     if (referer_ptr) {
-        sscanf(referer_ptr, "Referer: %[^\r\n]", referer);
+        sscanf(referer_ptr, "Referer: %255[^\r\n]", referer);
+    }
+
+    if (auth_ptr) {
+        strncpy(auth_header, auth_ptr, sizeof(auth_header) - 1);
+        // Extract just the base64 encoded part
+        char *space = strchr(auth_header, ' ');
+        if (space) {
+            char *base64_start = space + 1;
+            char *end = strchr(base64_start, '\r');
+            if (end) *end = '\0';
+        }
+    }
+
+    // Check authentication if enabled
+    if (config->auth_enabled) {
+        if (auth_ptr == NULL || !is_authenticated(auth_ptr, config->auth_user, config->auth_pass)) {
+            // Send authentication required response
+            char response[512];
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 407 Proxy Authentication Required\r\n"
+                    "Proxy-Authenticate: Basic realm=\"Proxy\"\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n\r\n");
+            send(client_socket, response, strlen(response), 0);
+            
+            if (config->verbose) {
+                printf("Authentication required for client %s\n", client_ip);
+            }
+            
+            close(client_socket);
+            free(args);
+            return;
+        }
     }
 
     // If verbose is enabled, print the details of the request
@@ -386,47 +1206,59 @@ void handle_connection(int client_socket, Config *config, struct sockaddr_in cli
         printf("Referer: %s\n", referer);
     }
 
-    // Check if the URL or hostname is blacklisted
+    // Extract hostname from URL
     char hostname[256];
-    sscanf(url, "http://%[^/]", hostname);
+    if (extract_hostname(url, hostname, sizeof(hostname)) != 0) {
+        if (config->verbose) {
+            printf("Failed to extract hostname from URL: %s\n", url);
+        }
+        send_http_error(client_socket, 400, "Invalid hostname in URL");
+        close(client_socket);
+        free(args);
+        return;
+    }
+    
+    if (config->verbose) {
+        printf("Extracted hostname: %s from URL: %s\n", hostname, url);
+    }
 
+    // Check if the URL or hostname is blacklisted
     if (is_blacklisted(config, hostname)) {
         if (config->verbose) {
-            printf("Blocked: The URL or IP %s is blacklisted.\n", hostname);
+            printf("Blocked: The hostname %s is blacklisted.\n", hostname);
         }
-        const char *blocked_response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-        send(client_socket, blocked_response, strlen(blocked_response), 0);
+        send_http_error(client_socket, 403, "This website is blocked by the proxy administrator");
         close(client_socket);
+        free(args);
         return;
     }
 
     // Check if it's an HTTPS connection (CONNECT method)
     if (strcmp(method, "CONNECT") == 0) {
-        char hostname[256];
-        int port = 443; // Default HTTPS port
-
-        // Parse the hostname and port from the URL (hostname:port)
-        sscanf(url, "%[^:]:%d", hostname, &port);
-
+        int port = extract_port(url, 443); // Default HTTPS port
+        
         if (config->verbose) {
             printf("Handling HTTPS request to %s on port %d\n", hostname, port);
         }
 
         // Handle the HTTPS connection
-        handle_https(client_socket, hostname, port);
+        handle_https(client_socket, hostname, port, config);
+        free(args);
         return;
     }
 
-    // Connect to the target HTTP server
+    // Handling HTTP connection
     struct hostent *server;
     struct sockaddr_in server_addr;
 
     server = gethostbyname(hostname);
     if (server == NULL) {
         if (config->verbose) {
-            printf("Error: Target host not found.\n");
+            printf("Error: Target host %s not found.\n", hostname);
         }
+        send_http_error(client_socket, 404, "Target host not found");
         close(client_socket);
+        free(args);
         return;
     }
 
@@ -435,8 +1267,17 @@ void handle_connection(int client_socket, Config *config, struct sockaddr_in cli
         if (config->verbose) {
             printf("Error creating server socket.\n");
         }
+        send_http_error(client_socket, 500, "Failed to create connection to target server");
         close(client_socket);
+        free(args);
         return;
+    }
+
+    // Set socket timeout
+    if (set_socket_timeout(server_socket, config->connection_timeout) < 0) {
+        if (config->verbose) {
+            perror("Failed to set server socket timeout");
+        }
     }
 
     server_addr.sin_family = AF_INET;
@@ -447,8 +1288,10 @@ void handle_connection(int client_socket, Config *config, struct sockaddr_in cli
         if (config->verbose) {
             printf("Error connecting to the server %s.\n", hostname);
         }
+        send_http_error(client_socket, 502, "Failed to connect to target server");
         close(client_socket);
         close(server_socket);
+        free(args);
         return;
     }
 
@@ -464,7 +1307,22 @@ void handle_connection(int client_socket, Config *config, struct sockaddr_in cli
     // Receive the response from the server and forward it to the client
     int total_bytes_sent = 0;
     while ((bytes_received = recv(server_socket, buffer, sizeof(buffer), 0)) > 0) {
-        send(client_socket, buffer, bytes_received, 0);
+        int bytes_sent = 0;
+        while (bytes_sent < bytes_received) {
+            int result = send(client_socket, buffer + bytes_sent, bytes_received - bytes_sent, 0);
+            if (result <= 0) {
+                if (config->verbose) {
+                    perror("Error sending data to client");
+                }
+                break;
+            }
+            bytes_sent += result;
+        }
+        
+        if (bytes_sent < bytes_received) {
+            break; // Failed to send all data
+        }
+        
         total_bytes_sent += bytes_received;
     }
 
@@ -477,51 +1335,88 @@ void handle_connection(int client_socket, Config *config, struct sockaddr_in cli
 
     close(server_socket);
     close(client_socket);
+    free(args);
 }
 
-// Function to be executed by each new thread
-void *thread_func(void *args) {
-    ThreadArgs *thread_args = (ThreadArgs *)args;
-    handle_connection(thread_args->client_socket, thread_args->config, thread_args->client_addr);
-    free(thread_args);  // Free memory
+// Thread pool worker function
+void *thread_pool_worker(void *arg) {
+    Config *config = (Config *)arg;
+    
+    while (!shutdown_flag) {
+        // Get job from queue
+        ThreadArgs *args = dequeue_job(&job_queue);
+        
+        // Check for shutdown
+        if (args == NULL && shutdown_flag) {
+            break;
+        }
+        
+        // Process the connection
+        if (args != NULL) {
+            handle_connection(args);
+            // Note: args is freed inside handle_connection
+        }
+    }
+    
     pthread_exit(NULL);
 }
 
 int main(int argc, char *argv[]) {
-    int proxy_socket, client_socket;
+    int proxy_socket;
     struct sockaddr_in proxy_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
     Config config;
+    pthread_t thread_pool[THREAD_POOL_SIZE];
 
-    // Default configuration values (fallback variables)
+    // Set up signal handlers
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    
+    // Default configuration values
     strcpy(config.listen_ip, FALLBACK_LISTEN_IP);
     config.port = FALLBACK_PORT;
     strcpy(config.allowed_hosts, FALLBACK_ALLOWED_HOSTS);
-    config.black_list_count = 0;  // Initialize the blacklist count
+    config.connection_timeout = DEFAULT_CONNECTION_TIMEOUT;
+    config.auth_enabled = DEFAULT_AUTH_ENABLED;
+    strcpy(config.auth_user, DEFAULT_AUTH_USER);
+    strcpy(config.auth_pass, DEFAULT_AUTH_PASS);
     config.verbose = 0;
+    config.black_list_count = 0;
+    
+    // Initialize client blocklist
+    initialize_blocklist(&config.client_blocklist);
 
-    // Load the configuration file (optional)
+    // Load the configuration file
     load_config_file(&config);
 
-    // Parse command-line arguments
+    // Parse command-line arguments (override config file)
     parse_arguments(argc, argv, &config);
 
     // Check for root permissions if necessary
     check_root_permissions(config.port);
+    
+    // Initialize the job queue
+    if (initialize_job_queue(&job_queue, MAX_QUEUE_SIZE) != 0) {
+        fprintf(stderr, "Failed to initialize job queue\n");
+        exit(EXIT_FAILURE);
+    }
 
     // Create the proxy socket
     proxy_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (proxy_socket < 0) {
         perror("Error creating proxy socket");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
+    
+    // Save the proxy socket for signal handler
+    global_proxy_socket = proxy_socket;
 
-    // Set socket options to reuse the address (fixes "Address already in use" issue)
+    // Set socket options to reuse the address
     int optval = 1;
     if (setsockopt(proxy_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
         perror("Error setting SO_REUSEADDR option");
         close(proxy_socket);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // Configure the proxy address
@@ -533,43 +1428,101 @@ int main(int argc, char *argv[]) {
     if (bind(proxy_socket, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr)) < 0) {
         perror("Error binding proxy socket");
         close(proxy_socket);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     // Listen for incoming connections
-    if (listen(proxy_socket, 10) < 0) {
+    if (listen(proxy_socket, SOMAXCONN) < 0) {
         perror("Error listening for connections");
         close(proxy_socket);
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
     printf("Proxy running on IP %s, Port %d...\n", config.listen_ip, config.port);
+    printf("Press Ctrl+C to exit.\n");
+    
+    // Create thread pool
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        if (pthread_create(&thread_pool[i], NULL, thread_pool_worker, &config) != 0) {
+            perror("Failed to create thread pool worker");
+            exit(EXIT_FAILURE);
+        }
+    }
 
-    // Main loop to handle incoming connections
-    while (1) {
-        client_socket = accept(proxy_socket, (struct sockaddr *)&client_addr, &client_len);
+    // Main loop to accept connections and add them to the job queue
+    while (!shutdown_flag) {
+        // Set timeout for accept
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(proxy_socket, &read_fds);
+        
+        struct timeval timeout;
+        timeout.tv_sec = 1;  // 1 second timeout to check shutdown_flag periodically
+        timeout.tv_usec = 0;
+        
+        int select_result = select(proxy_socket + 1, &read_fds, NULL, NULL, &timeout);
+        
+        if (select_result < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by signal
+            }
+            perror("Error in select");
+            break;
+        }
+        
+        if (select_result == 0) {
+            continue; // Timeout, check shutdown_flag
+        }
+        
+        // Accept new connection
+        int client_socket = accept(proxy_socket, (struct sockaddr *)&client_addr, &client_len);
+        
         if (client_socket < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by signal
+            }
             perror("Error accepting connection");
             continue;
         }
 
         // Create thread arguments
         ThreadArgs *args = malloc(sizeof(ThreadArgs));
+        if (args == NULL) {
+            perror("Failed to allocate memory for thread arguments");
+            close(client_socket);
+            continue;
+        }
+        
         args->client_socket = client_socket;
         args->config = &config;
         args->client_addr = client_addr;
 
-        // Create a new thread to handle the connection
-        pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, thread_func, (void *)args) != 0) {
-            perror("Error creating thread");
+        // Add job to queue
+        if (enqueue_job(&job_queue, args) != 0) {
+            fprintf(stderr, "Failed to enqueue job or shutdown in progress\n");
             close(client_socket);
             free(args);
-        } else {
-            pthread_detach(thread_id);  // Automatically clean up thread
+            continue;
         }
     }
 
+    printf("Shutting down proxy server...\n");
+    
+    // Signal all worker threads to exit
+    pthread_mutex_lock(&job_queue.mutex);
+    shutdown_flag = 1;
+    pthread_cond_broadcast(&job_queue.not_empty);
+    pthread_mutex_unlock(&job_queue.mutex);
+    
+    // Wait for all threads to finish
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        pthread_join(thread_pool[i], NULL);
+    }
+    
+    // Clean up
     close(proxy_socket);
+    destroy_job_queue(&job_queue);
+    
+    printf("Proxy server shutdown complete.\n");
     return 0;
 }
